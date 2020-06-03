@@ -25,9 +25,14 @@ mod lifetime;
 
 /// A type that represents that PgAllocator is an argument to the Rust function.
 type HasPgAllocatorArg = bool;
+type HasFcInfo = bool;
 
-fn create_function_params(num_args: usize, has_pg_allocator: HasPgAllocatorArg) -> TokenStream {
+fn create_function_params(num_args: usize, has_fcinfo: HasFcInfo, has_pg_allocator: HasPgAllocatorArg) -> TokenStream {
     let mut tokens = TokenStream::new();
+
+    if has_fcinfo {
+        tokens.extend(quote!(&mut func_info,));
+    }
 
     // if the allocator is the first arg we want to start at 1
     if has_pg_allocator {
@@ -84,22 +89,49 @@ fn check_for_pg_allocator(ty: &Type) -> bool {
     }
 }
 
+fn check_for_fc_info(ty: &Type) -> bool {
+    // we only accept references, i.e. &PgAllocator
+    let type_ref = match ty {
+        Type::Reference(type_ref) => type_ref,
+        _ => return false,
+    };
+
+    // find the path and ident
+    match *type_ref.elem {
+        Type::Path(ref path) => path
+            .path
+            .segments
+            .iter()
+            .last()
+            .map_or(false, |p| p.ident == stringify!(FunctionCallInfo)),
+        _ => false,
+    }
+}
+
 /// Returns a token stream of all the argument data extracted from the SQL function parameters
 ///   PgDatums, and converts them to the arg list for the Rust function.
 ///
 /// # Return
 ///
 /// The TokenStream of all the args, and a boolean if the first arg is the PgAllocator
-fn extract_arg_data(arg_types: &[Type]) -> (TokenStream, HasPgAllocatorArg) {
+fn extract_arg_data(mut arg_types: &[Type]) -> (TokenStream, HasFcInfo, HasPgAllocatorArg) {
     let mut get_args_stream = TokenStream::new();
 
-    // 1 to skip first 0, to use first arg.
+    let first_param_fcinfo = arg_types
+        .first()
+        .map_or(false, |ty| check_for_fc_info(ty));
+    if first_param_fcinfo {
+        arg_types = &arg_types[1..]
+    }
+
     let first_param_pg_allocator = arg_types
         .first()
         .map_or(false, |ty| check_for_pg_allocator(ty));
-    let skip_first = if first_param_pg_allocator { 1 } else { 0 };
+    if first_param_pg_allocator {
+        arg_types = &arg_types[1..]
+    }
 
-    for (i, arg_type) in arg_types.iter().skip(skip_first).enumerate() {
+    for (i, arg_type) in arg_types.iter().enumerate() {
         let arg_name = Ident::new(&format!("arg_{}", i), i.span());
         let arg_error = format!("unsupported function argument type for {}", arg_name);
 
@@ -117,7 +149,7 @@ fn extract_arg_data(arg_types: &[Type]) -> (TokenStream, HasPgAllocatorArg) {
         get_args_stream.extend(get_arg);
     }
 
-    (get_args_stream, first_param_pg_allocator)
+    (get_args_stream, first_param_fcinfo, first_param_pg_allocator)
 }
 
 fn sql_param_list(num_args: usize) -> String {
@@ -313,7 +345,7 @@ fn impl_info_for_fn(item: &syn::Item) -> TokenStream {
     function.extend(func_info);
 
     let arg_types = get_arg_types(inputs);
-    let (get_args_from_datums, has_pg_allocator) = extract_arg_data(&arg_types);
+    let (get_args_from_datums, has_fcinfo, has_pg_allocator) = extract_arg_data(&arg_types);
     // remove the optional Rust arguments from the sql argument count
     let num_sql_args = if has_pg_allocator {
         arg_types.len() - 1
@@ -321,7 +353,7 @@ fn impl_info_for_fn(item: &syn::Item) -> TokenStream {
         arg_types.len()
     };
 
-    let func_params = create_function_params(num_sql_args, has_pg_allocator);
+    let func_params = create_function_params(num_sql_args, has_fcinfo, has_pg_allocator);
 
     // wrap the original function in a pg_wrapper function
     let func_wrapper = quote_spanned!( func_name.span() =>
@@ -398,35 +430,35 @@ fn impl_info_for_fn(item: &syn::Item) -> TokenStream {
     let create_sql_name =
         syn::Ident::new(&format!("{}_pg_create_stmt", func_name), Span::call_site());
 
-    let (sql_param_types, _has_pg_allocator) = sql_param_types(&arg_types);
-    let sql_params = sql_param_list(num_sql_args);
-    let sql_options = sql_function_options(&arg_types);
-    let sql_return = sql_return_type(output);
+    // let (sql_param_types, _has_pg_allocator) = sql_param_types(&arg_types);
+    // let sql_params = sql_param_list(num_sql_args);
+    // let sql_options = sql_function_options(&arg_types);
+    // let sql_return = sql_return_type(output);
 
-    // ret and library_path are replacements at runtime
-    let sql_stmt = format!(
-        "CREATE or REPLACE FUNCTION {}({}) {{ret}} AS '{{library_path}}', '{}' LANGUAGE C{{opts}};",
-        func_name, sql_params, func_wrapper_name,
-    );
+    // // ret and library_path are replacements at runtime
+    // let sql_stmt = format!(
+    //     "CREATE or REPLACE FUNCTION {}({}) {{ret}} AS '{{library_path}}', '{}' LANGUAGE C{{opts}};",
+    //     func_name, sql_params, func_wrapper_name,
+    // );
 
     // declare a function that can be used to output a create statement for the externed function
     //   all create statements will be put into a common module for access
-    let create_sql_def = quote!(
-        #[allow(unused)]
-        pub fn #create_sql_name(library_path: &str) -> String {
-            use pg_extend::pg_type::PgTypeInfo;
-            format!(
-                #sql_stmt,
-                #sql_param_types
-                ret = #sql_return,
-                opts = #sql_options
-                library_path = library_path
-            )
-        }
-    );
+    // let create_sql_def = quote!(
+    //     #[allow(unused)]
+    //     pub fn #create_sql_name(library_path: &str) -> String {
+    //         use pg_extend::pg_type::PgTypeInfo;
+    //         format!(
+    //             #sql_stmt,
+    //             #sql_param_types
+    //             ret = #sql_return,
+    //             opts = #sql_options
+    //             library_path = library_path
+    //         )
+    //     }
+    // );
 
     function.extend(func_wrapper);
-    function.extend(create_sql_def);
+    // function.extend(create_sql_def);
 
     function
 }
